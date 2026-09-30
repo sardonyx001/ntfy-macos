@@ -68,6 +68,28 @@ private func makeSessionConfig() -> URLSessionConfiguration {
 final class NtfyClientTests: XCTestCase {
     // MARK: - URL Construction
 
+    func testConnectURLUsesWebSocketPath() {
+        let client = NtfyClient(serverURL: "https://ntfy.sh", topics: ["mytopic"])
+        XCTAssertEqual(client.buildConnectURL()?.path, "/mytopic/ws")
+    }
+
+    func testConnectURLJoinsMultipleTopics() {
+        let client = NtfyClient(serverURL: "https://ntfy.sh", topics: ["a", "b"])
+        XCTAssertEqual(client.buildConnectURL()?.path, "/a,b/ws")
+    }
+
+    func testConnectURLFetchesAllOnFirstConnectWhenFetchMissedEnabled() {
+        let client = NtfyClient(serverURL: "https://ntfy.sh", topics: ["mytopic"], fetchMissed: true)
+        XCTAssertEqual(client.buildConnectURL()?.query, "since=all")
+    }
+
+    /// A server URL with its own path (e.g. a reverse proxy at https://host/ntfy.sh)
+    /// must have the topic/ws path appended, not replace the existing path.
+    func testConnectURLPreservesServerPathPrefix() {
+        let client = NtfyClient(serverURL: "https://p.jamell.dev/ntfy.sh", topics: ["mytopic"])
+        XCTAssertEqual(client.buildConnectURL()?.path, "/ntfy.sh/mytopic/ws")
+    }
+
     func testClientInitialization() {
         let client = NtfyClient(serverURL: "https://ntfy.sh", topics: ["test"])
         XCTAssertNotNil(client)

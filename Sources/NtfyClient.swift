@@ -89,8 +89,7 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
     private var session: URLSession!
     private let delegateQueue: OperationQueue
-    private var dataTask: URLSessionDataTask?
-    private var buffer = Data()
+    private var webSocketTask: URLSessionWebSocketTask?
 
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 10
@@ -151,17 +150,16 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         }
     }
 
-    func connect() {
-        guard !isConnecting else { return }
-        isConnecting = true
-
+    /// Builds the ntfy websocket URL for the configured server/topics.
+    /// Internal for testing.
+    func buildConnectURL() -> URL? {
         let topicsString = topics.joined(separator: ",")
-        guard var components = URLComponents(string: serverURL) else {
-            isConnecting = false
-            return
-        }
+        guard var components = URLComponents(string: serverURL) else { return nil }
 
-        components.path = "/\(topicsString)/json"
+        // Append rather than replace: a proxied server URL (e.g. https://host/ntfy.sh)
+        // has its own path prefix that must be preserved.
+        let basePath = components.path.hasSuffix("/") ? String(components.path.dropLast()) : components.path
+        components.path = "\(basePath)/\(topicsString)/ws"
 
         // Add since parameter to fetch missed messages when enabled
         if fetchMissed {
@@ -174,14 +172,19 @@ final class NtfyClient: NSObject, @unchecked Sendable {
             }
         }
 
-        guard let url = components.url else {
+        return components.url
+    }
+
+    func connect() {
+        guard !isConnecting else { return }
+        isConnecting = true
+
+        guard let url = buildConnectURL() else {
             isConnecting = false
             return
         }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("application/x-ndjson", forHTTPHeaderField: "Accept")
 
         if let token = authToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -189,9 +192,12 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
         startPathMonitor()
 
-        buffer.removeAll()
-        dataTask = session.dataTask(with: request)
-        dataTask?.resume()
+        // WebSocket instead of a chunked/SSE GET: some inspection proxies (e.g. corporate
+        // TLS-inspecting gateways) buffer long-lived streaming HTTP responses indefinitely,
+        // but pass a WS-upgraded connection straight through.
+        webSocketTask = session.webSocketTask(with: request)
+        webSocketTask?.resume()
+        receive()
 
         Log.info("Connecting to ntfy: \(url.absoluteString)")
     }
@@ -202,10 +208,34 @@ final class NtfyClient: NSObject, @unchecked Sendable {
         reconnectTimer = nil
         stopWatchdog()
         stopPathMonitor()
-        dataTask?.cancel()
-        dataTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
         isConnecting = false
-        buffer.removeAll()
+    }
+
+    private func receive() {
+        webSocketTask?.receive { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let message):
+                self.lastDataReceived = Date()
+                switch message {
+                case .string(let text):
+                    self.processLine(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                case .data(let data):
+                    if let text = String(data: data, encoding: .utf8) {
+                        self.processLine(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+                @unknown default:
+                    break
+                }
+                self.receive()
+            case .failure:
+                // The task's own didCompleteWithError delegate callback handles
+                // logging/reconnect; nothing further to do here.
+                break
+            }
+        }
     }
 
     private func startWatchdog() {
@@ -253,7 +283,7 @@ final class NtfyClient: NSObject, @unchecked Sendable {
 
     func updateAuthToken(_ token: String?) {
         self.authToken = token
-        if dataTask != nil {
+        if webSocketTask != nil {
             reconnect()
         }
     }
@@ -261,8 +291,8 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     private func reconnect() {
         guard shouldReconnect else { return }
 
-        dataTask?.cancel()
-        dataTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
         isConnecting = false
 
         // Calculate delay with exponential backoff
@@ -363,24 +393,29 @@ final class NtfyClient: NSObject, @unchecked Sendable {
     }
 }
 
-extension NtfyClient: URLSessionDataDelegate {
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        lastDataReceived = Date()
-        buffer.append(data)
-
-        while let newlineRange = buffer.range(of: Data("\n".utf8)) {
-            let lineData = buffer.subdata(in: 0..<newlineRange.lowerBound)
-            buffer.removeSubrange(0..<newlineRange.upperBound)
-
-            if let line = String(data: lineData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                processLine(line)
-            }
+extension NtfyClient: URLSessionWebSocketDelegate {
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        isConnecting = false
+        reconnectAttempts = 0
+        startWatchdog()
+        callDelegate { delegate in
+            delegate.ntfyClientDidConnect(self)
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         isConnecting = false
         stopWatchdog()
+
+        // If the server rejected the upgrade (e.g. rate limiting), the HTTP response
+        // is still reachable off the task even though the socket never opened.
+        if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode == 429 {
+            if let retryAfterString = httpResponse.value(forHTTPHeaderField: "Retry-After") {
+                retryAfterDelay = parseRetryAfter(retryAfterString)
+            } else {
+                retryAfterDelay = 30.0
+            }
+        }
 
         if let error = error {
             let nsError = error as NSError
@@ -402,37 +437,6 @@ extension NtfyClient: URLSessionDataDelegate {
             if shouldReconnect {
                 reconnect()
             }
-        }
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        guard let httpResponse = response as? HTTPURLResponse else {
-            completionHandler(.cancel)
-            return
-        }
-
-        if httpResponse.statusCode == 200 {
-            isConnecting = false
-            reconnectAttempts = 0
-            startWatchdog()
-            callDelegate { delegate in
-                delegate.ntfyClientDidConnect(self)
-            }
-            completionHandler(.allow)
-        } else {
-            Log.error("Server returned status code: \(httpResponse.statusCode)")
-
-            // Handle rate limiting (429) - extract Retry-After header
-            if httpResponse.statusCode == 429 {
-                if let retryAfterString = httpResponse.value(forHTTPHeaderField: "Retry-After") {
-                    retryAfterDelay = parseRetryAfter(retryAfterString)
-                } else {
-                    // No Retry-After header, use a conservative default for 429
-                    retryAfterDelay = 30.0
-                }
-            }
-
-            completionHandler(.cancel)
         }
     }
 }
