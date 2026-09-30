@@ -8,6 +8,12 @@
 [![Homebrew](https://img.shields.io/badge/Homebrew-tap-brown.svg)](https://github.com/laurentftech/homebrew-ntfy-macos)
 [![Tests](https://img.shields.io/badge/Tests-177-brightgreen.svg)]()
 
+> **This is a fork.** Patched to connect over WebSocket instead of a chunked
+> streaming GET — some corporate TLS-inspection proxies silently swallow
+> long-lived streaming HTTP responses but pass WebSocket upgrades through
+> untouched — plus a couple of bugfixes and a native tap-to-copy content
+> window. See [AGENTS.md](AGENTS.md) for the full list and rationale.
+
 Receive push notifications on your Mac from any source — servers, IoT devices, home automation, CI pipelines, or custom scripts. No account required, works with the public [ntfy.sh](https://ntfy.sh) service or your own self-hosted server.
 
 **ntfy-macos** is a native macOS client that subscribes to ntfy topics and delivers rich notifications with SF Symbols, images, and interactive buttons. Trigger shell scripts automatically when messages arrive.
@@ -28,7 +34,7 @@ Receive push notifications on your Mac from any source — servers, IoT devices,
 - **Menu Bar App**: Runs in the menu bar with quick access to config and reload
 - **Live Config Reload**: Configuration changes are detected and applied automatically
 - **Config Validation**: Warns about unknown keys and typos in the menu bar
-- **Click to Open**: Click notifications to open in browser (configurable per topic)
+- **Click to Open**: Click notifications to open in browser if a click target is configured (per-topic `click_url` or a message `Click:` header) — otherwise opens a native window with the full message content, selectable and copyable
 - **Automatic Permission Request**: Prompts for notification permission on first launch
 - **Local Notification Server**: Built-in HTTP server on localhost for scripts to trigger notifications
 - **Settings Window**: Native SwiftUI interface for server and topic configuration with real-time connection status
@@ -51,6 +57,10 @@ brew install ntfy-macos
 # Clone the repository
 git clone https://github.com/laurentftech/ntfy-macos.git
 cd ntfy-macos
+
+# If `swift`/`swift test` isn't resolving to a toolchain (no default via swiftly),
+# point PATH at Xcode's toolchain explicitly:
+# export PATH="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
 
 # Build the app bundle
 ./build-app.sh
@@ -179,7 +189,7 @@ servers:
 - `icon_path` (optional): Path to a local image file
 - `auto_run_script` (optional): Script to execute on every message
 - `silent` (optional): If `true`, skip notification banner
-- `click_url` (optional): Custom URL to open on click
+- `click_url` (optional): Custom URL to open on click. If omitted and the message itself has no `Click:` header either, tapping the notification opens a native window with the message content instead of a browser
 - `actions` (optional): List of interactive buttons
 
 #### Action Fields
