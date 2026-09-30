@@ -15,6 +15,9 @@ final class NotificationManager: NSObject, @unchecked Sendable {
     private let lock = NSLock()
     private var _scriptRunner: (any ScriptRunnerProtocol)?
 
+    private var contentWindow: NSWindow?
+    private var contentWindowTextView: NSTextView?
+
     private override init() {
         super.init()
         // Don't call clearCategories() here - it accesses UNUserNotificationCenter
@@ -169,7 +172,11 @@ final class NotificationManager: NSObject, @unchecked Sendable {
         }
 
         var userInfo: [String: Any] = [
+            // Raw message body, kept for scripts/actions that expect the unmodified content.
             "messageBody": message.message ?? "",
+            // Markdown-stripped display copies, for the tap-to-view content window.
+            "messageTitle": message.plainTextTitle ?? message.title ?? message.topic,
+            "messageDisplayBody": message.plainTextMessage ?? message.message ?? "",
             "topic": message.topic,
             "serverUrl": clickUrl,
             "isCustomClickUrl": isCustomClickUrl,
@@ -471,18 +478,86 @@ extension NotificationManager: UNUserNotificationCenterDelegate {
     }
 
     private func openNotificationInWeb(userInfo: [AnyHashable: Any]) {
-        guard let serverUrl = userInfo["serverUrl"] as? String, !serverUrl.isEmpty,
-              let topic = userInfo["topic"] as? String else {
+        let serverUrl = userInfo["serverUrl"] as? String ?? ""
+        let isCustomClickUrl = userInfo["isCustomClickUrl"] as? Bool ?? false
+
+        if Self.shouldShowContentWindow(isCustomClickUrl: isCustomClickUrl, clickUrl: serverUrl) {
+            let title = userInfo["messageTitle"] as? String ?? ""
+            let body = userInfo["messageDisplayBody"] as? String ?? ""
+            DispatchQueue.main.async { [weak self] in
+                self?.showContentWindow(title: title, body: body)
+            }
             return
         }
 
-        let isCustomClickUrl = userInfo["isCustomClickUrl"] as? Bool ?? false
+        guard !serverUrl.isEmpty, let topic = userInfo["topic"] as? String else {
+            return
+        }
 
         // If custom URL, use it directly; otherwise append topic to server URL
         let webUrlString = isCustomClickUrl ? serverUrl : "\(serverUrl)/\(topic)"
         if let url = URL(string: webUrlString) {
             openUrlSecurely(url, forTopic: topic)
         }
+    }
+
+    /// Whether tapping a notification should show a native content window instead of
+    /// opening a URL: only when no one asked for a specific click target (no config
+    /// click_url, no message `Click:` header) and click isn't explicitly disabled.
+    /// Internal for testing.
+    static func shouldShowContentWindow(isCustomClickUrl: Bool, clickUrl: String) -> Bool {
+        !isCustomClickUrl && !clickUrl.isEmpty
+    }
+
+    /// Shows the full message title/body in a native window the user can select and copy.
+    /// Must be called on the main thread.
+    private func showContentWindow(title: String, body: String) {
+        contentWindow?.close()
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 280),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = title
+        window.center()
+        window.isReleasedWhenClosed = false
+
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 280))
+
+        let scrollView = NSScrollView(frame: NSRect(x: 16, y: 56, width: 388, height: 208))
+        scrollView.hasVerticalScroller = true
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.borderType = .bezelBorder
+
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.string = body
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = NSFont.systemFont(ofSize: 13)
+        textView.autoresizingMask = [.width]
+        scrollView.documentView = textView
+
+        contentView.addSubview(scrollView)
+
+        let copyButton = NSButton(title: "Copy", target: self, action: #selector(copyContentWindowText))
+        copyButton.frame = NSRect(x: 328, y: 16, width: 76, height: 28)
+        copyButton.bezelStyle = .rounded
+        contentView.addSubview(copyButton)
+
+        window.contentView = contentView
+        contentWindow = window
+        contentWindowTextView = textView
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func copyContentWindowText() {
+        guard let text = contentWindowTextView?.string else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private func handleActionResponse(_ response: UNNotificationResponse, messageBody: String, topic: String) {

@@ -20,4 +20,25 @@ final class NotificationManagerTests: XCTestCase {
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.url.path))
     }
+
+    // MARK: - Default-tap behavior: content window vs. opening a URL
+
+    /// No explicit click target was set (neither a config click_url nor a message
+    /// `Click:` header) — tapping the notification should show the content in a
+    /// native window the user can copy, not open the raw topic URL in a browser.
+    func testShouldShowContentWindowWhenNoExplicitClickTarget() {
+        XCTAssertTrue(NotificationManager.shouldShowContentWindow(isCustomClickUrl: false, clickUrl: "https://ntfy.sh"))
+    }
+
+    /// An explicit click target was set (config click_url or message `Click:` header) —
+    /// tapping should open it, honoring what the sender asked for.
+    func testShouldNotShowContentWindowWhenExplicitClickTargetSet() {
+        XCTAssertFalse(NotificationManager.shouldShowContentWindow(isCustomClickUrl: true, clickUrl: "https://example.com"))
+    }
+
+    /// Click is explicitly disabled for the topic (empty clickUrl, not custom) —
+    /// tapping should do nothing, not fall back to a content window.
+    func testShouldNotShowContentWindowWhenClickDisabled() {
+        XCTAssertFalse(NotificationManager.shouldShowContentWindow(isCustomClickUrl: false, clickUrl: ""))
+    }
 }
